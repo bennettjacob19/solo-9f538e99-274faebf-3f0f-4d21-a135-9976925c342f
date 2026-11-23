@@ -12,10 +12,19 @@ class WriteRequest(BaseModel):
 
     ``data`` 为原始字符串（按 UTF-8 编码，字节数须恰好等于 BLOCK_SIZE）；
     若内容含二进制或不可打印字符，可改用 ``data_base64``。两者只能给一个。
+
+    ``request_no`` 可选：组内递增请求号。带上后该写入幂等：
+    同号同块同内容重发只接续/回放原轮，不会再次落盘；请求号回退或
+    同号换块/换内容返回 409。不带的请求行为与旧版一致。
     """
 
     data: str | None = Field(default=None, description="原始字符串，UTF-8 编码后长度须等于 BLOCK_SIZE")
     data_base64: str | None = Field(default=None, description="base64 编码的定长数据，解码后长度须等于 BLOCK_SIZE")
+    request_no: int | None = Field(
+        default=None,
+        ge=0,
+        description="可选：组内递增请求号，用于幂等覆盖与续跑接管",
+    )
 
     def decode(self, block_size: int) -> bytes:
         if (self.data is None) == (self.data_base64 is None):
@@ -63,9 +72,11 @@ class RegionDetailResponse(RegionResponse):
 
 class MigrationResponse(BaseModel):
     in_progress: bool
+    round_id: str | None = None
     src_region_id: int | None = None
     dst_region_id: int | None = None
     group_id: int | None = None
+    request_no: int | None = None
     pending_block_id: int | None = None
     pending_applied: bool | None = None
     last_copied_block_id: int | None = None

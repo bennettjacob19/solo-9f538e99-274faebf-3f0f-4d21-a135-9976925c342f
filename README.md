@@ -30,6 +30,19 @@
      幂等续跑（重复执行已完成的步骤不会产生重复槽位）；
    - 若恰好停在 finalize 事务中途（源记录已删、状态未翻转），启动时 `recover()`
      自动补完。
+6. **带号幂等覆盖**（可选 `request_no`，组内递增）：
+   - 每个组在 `group_receipts` 表里只保留**最近一笔带号完成回执**：内容、序号、
+     物理区号、槽位；
+   - 同号 + 同块 + 同内容重发：只回放原回执（`replayed=true`），**即使槽位已被
+     整区回收也不再写盘**；
+   - 请求号小于最近完成号，或同号却换了块号 / 内容：返回 `409`，盘面不变；
+   - 带号覆盖触发满区搬迁时，旧回执保持不变；只有**该轮 finalize 的同一个事务**
+     才把完成回执替换为新值那一笔；
+   - 重启后同号重发若该轮尚未搬完，直接**接手原轮**（按 `round_id` 推进），
+     不会把 pending 新值重复落盘。
+7. **每轮独立推进 / 可取消**：每轮搬迁由独立后台 driver 分步推进。`resume` 或
+   同号覆盖请求只是附着到该轮并等待；请求在停顿中被取消后，driver 仍按原定下一步
+   搬完并腾出 spare，无需新请求。
 
 ### 区状态机
 
@@ -47,15 +60,16 @@ spare ──启动搬迁──▶ migrating（目标区，pending 先落盘）�
 | GET | `/config` | 布局参数（区数、组数、每区槽位、定长块大小） |
 | GET | `/health` | 健康检查（Docker healthcheck 使用） |
 | GET | `/groups/{gid}/blocks/{bid}` | 按组号+块号读取最新值（base64 + ASCII 表示） |
-| PUT | `/groups/{gid}/blocks/{bid}` | 写入定长数据；满区自动触发整区搬迁 |
+| PUT | `/groups/{gid}/blocks/{bid}` | 写入定长数据；满区自动触发整区搬迁；可带 `request_no` |
+| GET | `/groups/{gid}/receipt` | 该组最近一笔带号完成回执（内容/序号/物理区号/槽位） |
 | GET | `/regions` | 各物理区状态与槽位占用（used/free/有效块数） |
 | GET | `/regions/{rid}` | 某物理区每个槽位的实际内容 |
 | GET | `/migrations` | 当前搬迁进度（无搬迁时 `in_progress=false`） |
-| POST | `/migrations/resume` | 重启后续跑中断的搬迁 |
+| POST | `/migrations/resume` | 重启后续跑中断的搬迁；可带 `?round_id=` 只接手指定轮 |
 | POST | `/admin/regions/{rid}/reset` | 【演练】整区重置回收为 spare |
 | POST | `/admin/reset-all` | 【演练】清空全部数据 |
 
-写入请求体（二选一）：
+写入请求体（三选一组合）：
 
 ```json
 { "data": "abcdefgh" }
@@ -63,17 +77,44 @@ spare ──启动搬迁──▶ migrating（目标区，pending 先落盘）�
 ```json
 { "data_base64": "AAECAwQFBgcICQ==" }
 ```
+```json
+{ "data": "abcdefgh", "request_no": 42 }
+```
 
 原始字符串按 UTF-8 编码，字节数必须恰好等于 `BLOCK_SIZE`；二进制内容用 base64。
+`request_no` 可选：带上后该写入幂等（规则见上节），不带则行为与旧版一致。
 
 ### 响应约定
 
-- `200` 写入成功（`status=written` 普通追加，`status=migrated` 触发了搬迁）
+- `200` 写入成功（`status=written` 普通追加，`status=migrated` 触发了搬迁，
+  带号重发命中回执时 `replayed=true` 且 `status` 保持原回执状态）
 - `400` 数据长度不符 / base64 非法 / 两个字段同时出现
 - `404` 逻辑块尚无数据
 - `422` 组号、块号、区号越界
-- `409` 存储冲突（如已有搬迁进行中）
+- `409` 存储冲突：请求号回退 / 同号换块或换内容 / 已有搬迁进行中
 - `503` 本组搬迁中暂无 active 区，或 spare 被占用；带 `Retry-After: 1`
+
+写入回执含当时的内容、序号、物理区号与槽位：
+
+```json
+{
+  "status": "migrated",
+  "replayed": false,
+  "seq": 4,
+  "region_id": 0,
+  "slot_index": 0,
+  "receipt": {
+    "group_id": 0, "block_id": 0, "request_no": 42,
+    "seq": 4, "region_id": 0, "slot_index": 0,
+    "status": "migrated", "round_id": "…",
+    "data_ascii": "zzzzzzzz", "data_base64": "enp6enp6eno="
+  },
+  "last_step": {"kind": "done", "round_id": "…"}
+}
+```
+
+`/migrations` 与 `resume`（完成时）都返回该轮**最后一步**（`last_step`），并带
+`round_id`；`resume` 还可返回完成回执。
 
 ## 3. docker compose 启动
 
@@ -142,13 +183,43 @@ curl localhost:8000/migrations
 curl -X POST localhost:8000/migrations/resume
 ```
 
+### 带号覆盖 / 停机重发
+
+```bash
+# 写满组0（每块带组内递增请求号 1..3）
+for i in 1 2 3; do
+  curl -X PUT localhost:8000/groups/0/blocks/$((i-1)) \
+       -H 'Content-Type: application/json' \
+       -d "{\"data\":\"aaaaaaaa\",\"request_no\":$i}"
+done
+
+# 带号覆盖满区块0 -> 触发搬迁，回执带 request_no/seq/region_id/slot_index
+curl -X PUT localhost:8000/groups/0/blocks/0 \
+     -H 'Content-Type: application/json' \
+     -d '{"data":"zzzzzzzz","request_no":4}'
+
+# 原样重发：回放原回执（replayed=true），不再写盘
+curl -X PUT localhost:8000/groups/0/blocks/0 \
+     -H 'Content-Type: application/json' \
+     -d '{"data":"zzzzzzzz","request_no":4}'
+
+# 请求号回退 / 同号换块换内容 -> 409，盘面不变
+curl -X PUT localhost:8000/groups/0/blocks/1 \
+     -H 'Content-Type: application/json' \
+     -d '{"data":"zzzzzzzz","request_no":4}'
+```
+
 ## 6. 存储设计要点
 
 - **WAL + `synchronous=FULL` + `BEGIN IMMEDIATE`**：每步搬迁独立事务，提交即持久化。
 - `records` 表只增不改；`(group_id, block_id, seq)` 索引保证读路径取最新版本。
-- `migration` 单行表记录源/目标区、触发写入（pending）及拷贝进度；
+- `migration` 单行表记录 `round_id`、源/目标区、触发写入（pending）及拷贝进度；
   续跑时用“目标区已有的块号集合”判断进度，天然幂等。
-- 应用层单把 `asyncio.Lock` 串行化写操作；读不加锁，搬迁步间让出事件循环。
+- `group_receipts` 每组一行，保存最近一笔带号完成回执；与 finalize 事务同提交，
+  因此“搬完”与“回执替换”不会出现中间态。
+- 应用层单把 `asyncio.Lock` 串行化写事务；读不加锁。每轮搬迁由独立 driver 任务
+  推进，步间在锁外 `sleep(MIGRATION_STEP_DELAY)`：其他组的写可在停顿内落盘，
+  并发续跑都等同一段停顿结束；请求被取消不影响 driver。
 
 ## 7. 测试
 
@@ -159,4 +230,7 @@ pytest -q
 
 覆盖：append-only 不原地更新、定长校验、满区搬迁（全有效块/含历史版本）、
 每一步停机后的重启恢复、finalize 中途崩溃自愈、停机后重试覆盖、
-搬迁中其他组可写与本组 503、spare 占用约束、管理接口与全部 HTTP 校验。
+搬迁中其他组可写与本组 503、spare 占用约束、管理接口与全部 HTTP 校验；
+带号覆盖回执字段与回放、409 冲突盘面不变、整区回收后回执仍不写盘、
+回执只在下一笔带号轮 finalize 时替换、停机后同号重发接管原轮、
+多并发 resume 等待步间停顿、停顿内跨组写入落盘、取消 resume 后自动搬完。
